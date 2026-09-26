@@ -143,24 +143,36 @@ def _parse_requirement(raw: str, *, name_override: Optional[str], origin: str) -
 
 
 def _iter_dependencies(raw: Any, origin: str):
-    """Yield ParsedDependency objects from a mapping or PEP 508 string list."""
+    """Yield ``(position, original_text, ParsedDependency)`` tuples.
+
+    Works for both a mapping and a list of PEP 508 strings.  ``position`` is
+    the zero-based position in the input (list index or mapping insertion
+    order) and ``original_text`` is the requirement exactly as supplied, so
+    callers can distinguish duplicate requirements.
+    """
     if raw is None:
         return
     if isinstance(raw, dict):
-        for package, spec in raw.items():
+        for position, (package, spec) in enumerate(raw.items()):
             if spec is None:
                 spec = ""
             if not isinstance(spec, str):
                 raise ResolutionInputError(
                     f"{origin}: dependency spec for {package!r} must be a string"
                 )
-            yield _parse_requirement(spec, name_override=package, origin=origin)
+            yield (
+                position,
+                f"{package} {spec}".strip(),
+                _parse_requirement(spec, name_override=package, origin=origin),
+            )
         return
     if isinstance(raw, list):
-        for item in raw:
+        for position, item in enumerate(raw):
             if not isinstance(item, str):
                 raise ResolutionInputError(f"{origin}: dependency list items must be strings")
-            yield _parse_requirement(item, name_override=None, origin=origin)
+            yield position, item, _parse_requirement(
+                item, name_override=None, origin=origin
+            )
         return
     raise ResolutionInputError(f"{origin}: dependencies must be an object or a list of strings")
 
@@ -206,21 +218,51 @@ def parse_index(packages: dict[str, Any]) -> tuple[PackageIndex, list[str]]:
             deps: list[ParsedDependency] = []
             if "dependencies" in body:
                 try:
-                    deps = list(_iter_dependencies(body["dependencies"], origin))
+                    deps = [
+                        dep
+                        for _position, _text, dep in _iter_dependencies(
+                            body["dependencies"], origin
+                        )
+                    ]
                 except ResolutionInputError as exc:
                     errors.append(str(exc))
                     continue
-            records.append((parsed_version, VersionRecord(dependencies=tuple(deps))))
+            records.append(
+                (parsed_version, VersionRecord(dependencies=tuple(deps)))
+            )
         index.versions[canonical] = records
 
     return index, errors
 
 
+@dataclass(frozen=True)
+class RootEntry:
+    """A root requirement with its position and original text.
+
+    Duplicate requirements (identical text appearing more than once, or
+    different spellings normalizing to the same canonical package) stay
+    distinguishable through ``index``.
+    """
+
+    index: int  # 0-based position in the root list / mapping
+    requirement: str  # requirement text exactly as supplied
+    dep: ParsedDependency
+
+
+def parse_root_entries(raw: Any, origin: str) -> list[RootEntry]:
+    """Parse root requirements while preserving input position and text.
+
+    Uses the exact same PEP 440/508 rules as :func:`parse_requirements`; the
+    positions refer to the original input, not a marker-filtered list.
+    """
+    return [
+        RootEntry(index=position, requirement=text, dep=dep)
+        for position, text, dep in _iter_dependencies(raw, origin)
+    ]
+
+
 def parse_requirements(raw: Any, origin: str) -> list[ParsedDependency]:
-    try:
-        return list(_iter_dependencies(raw, origin))
-    except ResolutionInputError:
-        raise
+    return [dep for _position, _text, dep in _iter_dependencies(raw, origin)]
 
 
 def parse_locks(raw: dict[str, str]) -> tuple[dict[str, Version], list[str]]:

@@ -28,6 +28,12 @@
   默认环境下求值（可用 `marker_env` 覆盖），保证结果可复现。
 - **同步 + 异步两种用法**：`POST /resolve` 立即返回；`POST /jobs` 把同样的请求
   持久化到 SQLite 后由后台 worker 顺序执行，可查询、可协作取消，重启自动恢复。
+- **根需求冲突诊断**：`POST /diagnose/root-conflict` 接收与 `/resolve` **完全相同
+  的请求体**；完整输入无解时，按稳定顺序逐条暂删根需求并重新求解，返回一个
+  **最小冲突根集合**——集合自身仍无解，但删去其中任一条即变为可解。集合条目保留
+  原始需求文本与输入位置（重复项可区分），结论由对子集的实际重算得到，而非摘取
+  某次回溯分支的冲突路径；初始求解或任一次复算触及 `max_attempts` 时返回
+  `undetermined`，绝不把搜索触顶判作无解。
 - **漏洞审计**：`POST /audit/vulnerabilities` 直接接收 `/resolve` 成功响应中的
   `resolved` 与 `dependency_graph`，对照本地公告列表（PEP 440 受影响范围）匹配
   已解析版本；每个命中项给出从 `<root>` 到该包的**全部最短路径**（支持环与菱形
@@ -60,6 +66,7 @@ docker compose up --build
 
 - `GET /health` — 健康检查
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
+- `POST /diagnose/root-conflict` — 诊断最小冲突根需求集合（与 `/resolve` 同请求体）
 - `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
 - `POST /audit/dependency-chokepoints` — 审计依赖图的必经依赖（支配者/关键节点）
@@ -478,6 +485,82 @@ curl -s -X POST localhost:8000/plan/rebuild \
   （`<root>` 边的 `source_version` 必须为空）；
 - `changed` 中的名称必须是非空字符串，规范化后不得为 `<root>`。
 
+## 根需求冲突诊断 API
+
+`POST /diagnose/root-conflict` 接收与 `/resolve` **完全相同的请求体**（`packages`、
+`root`、`locks`、`allow_prereleases`、`marker_env`、`max_attempts`，校验规则也完全
+一致），并复用同一套 PEP 440/508 解析规则，但不直接返回解，而是回答：**无解时，
+哪些根需求必须同时存在才导致无解？**
+
+完整输入无解时，按**稳定顺序**（根需求的原始输入顺序）逐条**暂删**一条根需求并
+重新求解剩余集合（删除式最小化；同一轮输入顺序、同一份 locks、marker 环境与
+`max_attempts` 预算）：
+
+- 剩余集合**仍无解**：该条对冲突不是必需的，永久删除；
+- 剩余集合**变为可解**：该条属于冲突集合，恢复保留。
+
+该遍历会重复到一整轮都删不掉任何条目为止。最终返回的是一个**最小冲突根集合**：
+集合自身仍无解，但删去其中**任一条**后剩余集合都可解。结论由对子集的**实际重算**
+给出——求解器某次回溯分支的冲突路径只展示了众多失败方式中的一种，不能据此摘取
+冲突根。
+
+```bash
+curl -s -X POST localhost:8000/diagnose/root-conflict \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "service-a": {"1.0": {"dependencies": {"libfoo": ">=2.0"}}},
+    "service-b": {"1.0": {"dependencies": {"libfoo": "<2.0"}}},
+    "libfoo": {"1.0": {}, "2.0": {}, "3.0": {}}
+  },
+  "root": ["service-a", "service-b"]
+}'
+```
+
+响应（完整输入无解，HTTP 200）：
+
+```json
+{
+  "status": "conflict",
+  "attempts": 6,
+  "allow_prereleases": false,
+  "conflicting_roots": [
+    {"index": 0, "package": "service-a", "requirement": "service-a",
+     "specifier": "", "marker": null},
+    {"index": 1, "package": "service-b", "requirement": "service-b",
+     "specifier": "", "marker": null}
+  ]
+}
+```
+
+`conflicting_roots` 条目字段：
+
+- `index`：该需求在**原始输入**中的零基位置（列表下标；映射形式则为映射的插入
+  顺序下标），删除后其余条目的位置不重新编号。
+- `requirement`：**原始需求文本**，逐字保留（列表形式即原字符串，如
+  `"x>=1.0; python_version >= '3.11'"`；映射形式按 `<原键> <说明符>` 还原，如
+  `"X ==2.0"`，不规范化键名拼写）。
+- `package`：规范化后的目标包名；`specifier` 为解析后的说明符文本；`marker` 为
+  环境标记文本或 `null`。
+
+因此完全重复的根需求（或拼写不同但规范化后同名的需求）仍可凭 `index` 逐条区分；
+最小集合不会因为重复项而被重复报告（暂删其中一条后另一条仍在，冲突依旧，重复项
+会在最小化过程中被删掉，位置靠前的先被删）。
+
+其他响应形态（HTTP 状态码均为 **200**，由 `status` 区分；请求体非法时与
+`/resolve` 一样返回 `400/422`）：
+
+- **可解**：`{"status": "ok", "attempts": 1, "allow_prereleases": false,
+  "conflicting_roots": []}`。
+- **未确定**：初始求解或**任一次复算**触及 `max_attempts` 时返回
+  `{"status": "undetermined", ..., "conflicting_roots": null,
+  "error": {"code": "search_limit_exceeded", "message": "..."}}`。搜索触顶不是无解
+  的证据，因此既不会报告冲突集合，也不会把输入判作无解；`message` 会指出是初始
+  求解触顶，还是暂删哪一条（带 `index` 与原始需求）后的复算触顶。
+
+诊断过程是确定的：相同输入永远得到相同的冲突集合与 `attempts`（该字段汇总初始
+求解与全部复算实际求值的候选次数）。注意最小冲突集合不唯一时，结果取决于上述
+稳定删除顺序，但恒为“删任一条即可解”的最小集合。
+
 ## 数据持久化
 
 异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
@@ -490,6 +573,8 @@ curl -s -X POST localhost:8000/plan/rebuild \
 如需清空历史，可删除卷：`docker compose down -v`。
 
 ## 请求格式
+
+`/resolve`、`POST /jobs` 与 `/diagnose/root-conflict` 使用**完全相同**的请求体：
 
 ```json
 {
@@ -635,13 +720,14 @@ pytest -q
 app/
   resolver.py       # PEP 440/508 解析、候选排序、回溯求解器、冲突数据结构、取消点
   serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
+  diagnose.py       # 根需求冲突诊断：逐条暂删+复算的最小冲突根集合（搜索触顶返回未确定）
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/audit/*、/plan/rebuild、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计与重建计划）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计与重建计划）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml

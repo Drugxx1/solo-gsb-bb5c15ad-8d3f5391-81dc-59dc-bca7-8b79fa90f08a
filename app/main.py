@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import run_audit
 from .chokepoint_audit import run_dependency_chokepoints
+from .diagnose import run_root_conflict_diagnosis
 from .license_audit import run_license_audit
 from .jobs import (
     CANCELLED,
@@ -26,7 +27,7 @@ from .resolver import (
     ResolutionInputError,
     parse_index,
     parse_locks,
-    parse_requirements,
+    parse_root_entries,
     resolve,
 )
 from .serialize import conflict_summary
@@ -186,7 +187,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -205,18 +206,20 @@ def _parse_input(payload: ResolveRequest):
 
     Cheap (no solving), so it can run synchronously on both ``/resolve`` and
     ``POST /jobs`` to reject malformed input with 400 before queueing.
+    Returns the root requirements as position-annotated entries; callers
+    that only need parsed requirements take ``[entry.dep for entry in ...]``.
     """
     index, index_errors = parse_index(payload.packages)
     if index_errors:
         raise ResolutionInputError("; ".join(index_errors))
 
-    roots = parse_requirements(payload.root, "root requirements")
+    entries = parse_root_entries(payload.root, "root requirements")
 
     locks, lock_errors = parse_locks(payload.locks or {})
     if lock_errors:
         raise ResolutionInputError("; ".join(lock_errors))
 
-    return index, roots, locks
+    return index, entries, locks
 
 
 def _resolve_body(
@@ -228,11 +231,11 @@ def _resolve_body(
     ``ResolutionCancelled`` is allowed to propagate so the job worker can
     finalise the job as cancelled at a candidate boundary.
     """
-    index, roots, locks = _parse_input(payload)
+    index, entries, locks = _parse_input(payload)
 
     result = resolve(
         index,
-        roots,
+        [entry.dep for entry in entries],
         locks,
         allow_prereleases=payload.allow_prereleases,
         marker_env=payload.marker_env,
@@ -288,6 +291,38 @@ def run_resolution_job(
 async def resolve_endpoint(payload: ResolveRequest) -> JSONResponse:
     body, status_code, _error, _attempts = _resolve_body(payload)
     return JSONResponse(status_code=status_code, content=body)
+
+
+@app.post("/diagnose/root-conflict")
+async def diagnose_root_conflict_endpoint(payload: ResolveRequest) -> JSONResponse:
+    """Find a minimal conflicting subset of the root requirements.
+
+    Accepts the exact same request body as ``/resolve`` and reuses its
+    PEP 440/508 parsing rules.  When the full input is unsatisfiable, root
+    requirements are temporarily deleted one at a time in input order and
+    the remainder is re-solved, yielding a *minimal* conflicting root set:
+    the set itself has no solution, but deleting any single entry from it
+    becomes solvable.  Entries carry the original requirement text and its
+    position in the input, so duplicate requirements stay distinguishable.
+
+    All outcomes return 200; the ``status`` field discriminates:
+
+    * ``ok`` — the full input is solvable; ``conflicting_roots`` is empty.
+    * ``conflict`` — ``conflicting_roots`` holds the minimal set.
+    * ``undetermined`` — the initial solve or a re-solve hit
+      ``max_attempts``; hitting the search limit is not treated as a
+      contradiction, so no set is reported (``conflicting_roots`` is null).
+    """
+    index, entries, locks = _parse_input(payload)
+    body = run_root_conflict_diagnosis(
+        index,
+        entries,
+        locks,
+        allow_prereleases=payload.allow_prereleases,
+        marker_env=payload.marker_env,
+        max_attempts=payload.max_attempts,
+    )
+    return JSONResponse(status_code=200, content=body)
 
 
 @app.post("/audit/vulnerabilities")
