@@ -24,6 +24,12 @@
   - 互相矛盾的约束（说明符、提出者及其版本）；
   - 每条约束完整的**依赖路径**（从根一路到提出约束的包）；
   - 候选版本清单与已尝试版本，以及整棵失败分支树，而不是一句笼统错误。
+- **最小冲突根诊断**：`POST /diagnose/root-conflict` 接收与 `/resolve`
+  相同的请求体；完整输入无解时，按输入位置顺序逐条暂删根需求并**实际重新
+  求解**，给出**最小冲突根集合**——集合本身不可解，但从中再删去任一条即可
+  解（不会只摘取某次回溯分支的冲突路径）。集合条目保留原始需求文本与输入
+  位置，重复出现的需求可逐条区分；完整输入可解时返回空集合；初次或任一次
+  复算触及 `max_attempts` 时返回未确定状态，绝不把搜索触顶误判为无解。
 - **PEP 508**：依赖可写成 `name[extra] spec; marker` 字符串；环境标记在固定的
   默认环境下求值（可用 `marker_env` 覆盖），保证结果可复现。
 - **同步 + 异步两种用法**：`POST /resolve` 立即返回；`POST /jobs` 把同样的请求
@@ -64,6 +70,7 @@ docker compose up --build
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
 - `POST /audit/dependency-chokepoints` — 审计依赖图的必经依赖（支配者/关键节点）
 - `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
+- `POST /diagnose/root-conflict` — 诊断最小冲突根集合（请求体与 `/resolve` 相同）
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -478,6 +485,95 @@ curl -s -X POST localhost:8000/plan/rebuild \
   （`<root>` 边的 `source_version` 必须为空）；
 - `changed` 中的名称必须是非空字符串，规范化后不得为 `<root>`。
 
+## 根冲突诊断 API
+
+`POST /diagnose/root-conflict` 接收与 `/resolve` **完全相同的请求体**
+（`packages` / `root` / `locks` / `allow_prereleases` / `marker_env` /
+`max_attempts`，解析与校验规则一致，非法输入同样返回 `400/422`），用于回答
+“哪些根需求凑在一起导致无解”。诊断过程：
+
+1. 先对完整输入求解：可解则直接返回 `solvable` 与空集合；
+2. 若无解，按**输入位置顺序**逐条暂删根需求并重新求解——删掉某条后仍然
+   无解，说明该条与冲突无关，永久剔除；否则该条是冲突所必需，予以保留；
+3. 初次求解或**任一次**复算触及 `max_attempts` 时，返回 `undetermined`
+   （搜索触顶不是无解的证据，绝不据此给出冲突集合）。
+
+最终返回的集合是**最小冲突根集合**：集合本身不可解，且从中再删去任一条
+即可解。两条性质都由实际重新求解验证，而不是摘取某次回溯分支的冲突路径；
+根需求集合具有单调性（删减需求只会放松问题），因此该最小性是有保证的。
+相同输入永远得到相同输出。
+
+```bash
+curl -s -X POST localhost:8000/diagnose/root-conflict \
+  -H 'Content-Type: application/json' -d '{
+  "packages": {
+    "service-a": {"1.0": {"dependencies": {"libfoo": ">=2.0"}}},
+    "service-b": {"1.0": {"dependencies": {"libfoo": "<2.0"}}},
+    "docs": {"1.0": {}},
+    "libfoo": {"1.0": {}, "2.0": {}, "3.0": {}}
+  },
+  "root": ["service-a", "docs", "service-b"]
+}'
+```
+
+响应（200，`status` 为 `conflict`）：
+
+```json
+{
+  "status": "conflict",
+  "attempts": 10,
+  "rounds": 4,
+  "allow_prereleases": false,
+  "conflicting_roots": [
+    {"position": 0, "requirement": "service-a", "name": "service-a",
+     "specifier": "", "marker": null},
+    {"position": 2, "requirement": "service-b", "name": "service-b",
+     "specifier": "", "marker": null}
+  ]
+}
+```
+
+- `conflicting_roots`：最小冲突根集合，按输入位置升序。上例中 `docs` 与
+  `libfoo` 的版本矛盾无关，已被剔除。每个条目含：
+  - `position`：在 `root` 中的输入位置（映射形式为插入序，列表形式为
+    下标）；重复出现的相同需求靠它逐条区分；
+  - `requirement`：原始需求文本——列表形式逐字保留（含 extras 与
+    marker），映射形式重组为 `包名+说明符`；可直接作为 `/resolve` 的根
+    需求复用；
+  - `name` / `specifier` / `marker`：解析后的规范化包名、说明符与环境
+    标记（无标记为 `null`）。
+- `rounds`：实际执行的求解轮数（首次 1 轮 + 每条根需求 1 轮复算）；
+  `attempts`：各轮候选求值次数之和。
+
+完整输入可解时（200）：
+
+```json
+{
+  "status": "solvable",
+  "attempts": 3,
+  "rounds": 1,
+  "allow_prereleases": false,
+  "conflicting_roots": []
+}
+```
+
+初次或任一次复算触及 `max_attempts` 时（200）：
+
+```json
+{
+  "status": "undetermined",
+  "attempts": 4,
+  "rounds": 1,
+  "allow_prereleases": false,
+  "conflicting_roots": null,
+  "detail": "initial resolution exceeded 3 candidate evaluations; the input may still be satisfiable"
+}
+```
+
+三种结论都返回 `200`（诊断本身成功完成），由 `status` 区分；`undetermined`
+时 `conflicting_roots` 为 `null` 并附 `detail` 说明在哪一步触顶。诊断是
+只读分析，不产生作业，也不影响 `/resolve` 的既有行为。
+
 ## 数据持久化
 
 异步作业保存在 SQLite（WAL 模式），数据库路径由环境变量 `RESOLVER_DB` 控制，
@@ -639,8 +735,9 @@ app/
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
+  root_conflict.py  # 根冲突诊断：逐条暂删根需求并重新求解，输出最小冲突根集合
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/audit/*、/plan/rebuild、/jobs、/health
+  main.py           # FastAPI 应用与 /resolve、/audit/*、/plan/rebuild、/diagnose/root-conflict、/jobs、/health
 tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计与重建计划）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile

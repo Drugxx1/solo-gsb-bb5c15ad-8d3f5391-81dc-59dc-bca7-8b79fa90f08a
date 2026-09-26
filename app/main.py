@@ -29,6 +29,7 @@ from .resolver import (
     parse_requirements,
     resolve,
 )
+from .root_conflict import RootItem, bind_root_items, diagnose_root_conflict
 from .serialize import conflict_summary
 
 DEFAULT_DB_PATH = os.path.join("data", "jobs.db")
@@ -186,7 +187,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -357,6 +358,57 @@ async def rebuild_plan_endpoint(payload: RebuildPlanRequest) -> JSONResponse:
     body = run_rebuild_plan(
         payload.resolved, payload.dependency_graph, payload.changed
     )
+    return JSONResponse(status_code=200, content=body)
+
+
+def _root_item_view(item: RootItem) -> dict[str, Any]:
+    return {
+        "position": item.position,
+        "requirement": item.requirement,
+        "name": item.name,
+        "specifier": item.specifier,
+        "marker": item.marker,
+    }
+
+
+@app.post("/diagnose/root-conflict")
+async def diagnose_root_conflict_endpoint(payload: ResolveRequest) -> JSONResponse:
+    """Find a minimal set of root requirements that cannot co-resolve.
+
+    Accepts the same payload as ``/resolve``.  The full input is solved
+    first; if it conflicts, root requirements are temporarily removed one
+    at a time (in input order) and the remainder re-solved, keeping only
+    the entries essential to the conflict.  The returned set is minimal:
+    the set itself is unsatisfiable, but removing any single entry from
+    it resolves.  Entries carry the original requirement text and input
+    position so duplicates stay distinguishable.  If the initial solve or
+    any re-solve exhausts ``max_attempts``, the outcome is reported as
+    ``undetermined`` -- hitting the search ceiling is never reported as a
+    conflict.
+    """
+    index, roots, locks = _parse_input(payload)
+    items = bind_root_items(payload.root, roots)
+    diagnosis = diagnose_root_conflict(
+        index,
+        items,
+        locks,
+        allow_prereleases=payload.allow_prereleases,
+        marker_env=payload.marker_env,
+        max_attempts=payload.max_attempts,
+    )
+    body: dict[str, Any] = {
+        "status": diagnosis.status,
+        "attempts": diagnosis.attempts,
+        "rounds": diagnosis.rounds,
+        "allow_prereleases": payload.allow_prereleases,
+        "conflicting_roots": (
+            None
+            if diagnosis.items is None
+            else [_root_item_view(item) for item in diagnosis.items]
+        ),
+    }
+    if diagnosis.detail is not None:
+        body["detail"] = diagnosis.detail
     return JSONResponse(status_code=200, content=body)
 
 
